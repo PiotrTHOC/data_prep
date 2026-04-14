@@ -185,4 +185,12 @@ ml_matrix$TPM <- log2(ml_matrix$TPM + 1)
 numeric_cols <- sapply(ml_matrix, is.numeric)
 ml_matrix[, numeric_cols] <- scale(ml_matrix[, numeric_cols])
 
+cat("Dimensions:", nrow(ml_matrix), "rows x", ncol(ml_matrix), "columns\n")
+cat("Samples:\n")
+print(table(ml_matrix$sample))
+cat("\nLabels:\n")
+print(table(ml_matrix$label))
+cat("\nFeature summary:\n")
 summary(ml_matrix)
+
+write.csv(ml_matrix, here::here("ml_matrix.csv"), row.names = FALSE)
