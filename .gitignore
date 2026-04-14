@@ -1,0 +1,24 @@
+# Data files
+*.bed.gz
+*.bigWig
+*.bedpe.gz
+*.gtf
+*.gff
+*.tsv
+*.bam
+*.bai
+*.fastq
+*.fastq.gz
+*.fasta
+*.fa
+
+# R environment
+.Rhistory
+.RData
+.Rproj.user/
+renv/library/
+renv/staging/
+
+# OS
+.DS_Store
+Thumbs.db
