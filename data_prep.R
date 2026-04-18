@@ -1,4 +1,8 @@
-# load libraries
+if (!requireNamespace("TCGAbiolinks", quietly = TRUE))
+  BiocManager::install("TCGAbiolinks")
+
+
+## load libraries
 library(here)
 library(ChIPseeker)
 library(GenomicRanges)
@@ -9,11 +13,16 @@ library(GenomeInfoDb)
 library(dplyr)
 library(purrr)
 library(org.Hs.eg.db)
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(tidyr)
 
-# TxDb
-txdb <- txdbmaker::makeTxDbFromGFF(here::here("input", "GENCODE_v32.gtf"))
+
+## TxDb and gene mapping
+txdb <- txdbmaker::makeTxDbFromGFF(here::here("GENCODE_v32.gtf"))
 seqlevelsStyle(txdb) <- "UCSC"
 genome(txdb) <- "hg38"
+
 
 # Build transcript (ENST) → gene (ENSG) mapping via org.Hs.eg.db
 # The GTF uses ENST IDs for both gene_id and transcript_id (UCSC knownGene format)
@@ -26,7 +35,9 @@ tx2gene_clean <- AnnotationDbi::mapIds(
   multiVals = "first"
 )
 
-# Core function: annotate peaks and summarize per gene
+
+## Core functions
+# 1. annotate peaks and summarize per gene
 annotate_and_summarize <- function(file, mark_name, txdb, tx2gene_clean) {
 
   if (!file.exists(file)) {
@@ -36,7 +47,7 @@ annotate_and_summarize <- function(file, mark_name, txdb, tx2gene_clean) {
   peak <- readPeakFile(file)
 
   # normalize signal column
-  peak$signalValue <- peak$V7
+  peak$signalValue <- as.numeric(peak$V7)
   peak$pvalue <- peak$V8
   peak$qvalue <- peak$V9
   genome(peak) <- "hg38"
@@ -79,58 +90,260 @@ annotate_and_summarize <- function(file, mark_name, txdb, tx2gene_clean) {
   return(features)
 }
 
-# Sample definitions
+# 2.Extract HiC distal peaks
+extract_distal_peaks <- function(file) {
+  
+  peak <- readPeakFile(file)
+  
+  peak$signalValue <- as.numeric(peak$V7)
+  genome(peak) <- "hg38"
+  seqlevelsStyle(peak) <- "UCSC"
+  
+  return(peak)
+}
+
+# 3.Build HiC interactions
+load_hic_interactions <- function(hic_file) {
+  
+  message("Processing Hi-C: ", hic_file)
+  
+  hic <- read.table(hic_file, header = FALSE, stringsAsFactors = FALSE)
+  
+  # ensure at least 6 columns
+  if (ncol(hic) < 6) {
+    stop("Hi-C file has fewer than 6 columns (invalid BEDPE)")
+  }
+  
+  # assign basic columns
+  colnames(hic)[1:6] <- c(
+    "chr1","start1","end1",
+    "chr2","start2","end2"
+  )
+  
+  # build GRanges
+  gr1 <- GRanges(hic$chr1, IRanges(hic$start1, hic$end1))
+  gr2 <- GRanges(hic$chr2, IRanges(hic$start2, hic$end2))
+  
+  genome(gr1) <- "hg38"
+  genome(gr2) <- "hg38"
+  
+  seqlevelsStyle(gr1) <- "UCSC"
+  seqlevelsStyle(gr2) <- "UCSC"
+  
+  return(list(gr1 = gr1, gr2 = gr2))
+}
+
+
+# 4.Compute HiC-connected enhancer signals
+compute_hic_connected_distal <- function(distal_peaks, hic_obj) {
+  
+  gr1 <- hic_obj$gr1
+  gr2 <- hic_obj$gr2
+  prom_links <- hic_obj$links
+  
+  # safety check
+  if (nrow(prom_links) == 0 || length(distal_peaks) == 0) {
+    return(data.frame(gene=character(), distal_connected=numeric()))
+  }
+  
+  distal_hits1 <- findOverlaps(distal_peaks, gr1)
+  distal_hits2 <- findOverlaps(distal_peaks, gr2)
+  
+  distal_map <- rbind(
+    data.frame(
+      peak = queryHits(distal_hits1),
+      region = subjectHits(distal_hits1),
+      side = "gr1"
+    ),
+    data.frame(
+      peak = queryHits(distal_hits2),
+      region = subjectHits(distal_hits2),
+      side = "gr2"
+    )
+  )
+  
+  # SAFE EXIT
+  if (!is.data.frame(distal_map) || nrow(distal_map) == 0) {
+    return(data.frame(gene=character(), distal_connected=numeric()))
+  }
+  
+  merged <- merge(prom_links, distal_map, by=c("region","side"))
+  
+  if (nrow(merged) == 0) {
+    return(data.frame(gene=character(), distal_connected=numeric()))
+  }
+  
+  merged$signal <- distal_peaks$signalValue[merged$peak]
+  merged$signal[is.na(merged$signal)] <- 0
+  
+  merged <- merged %>%
+    dplyr::distinct(gene, peak, .keep_all = TRUE)
+  
+  result <- merged %>%
+    group_by(gene) %>%
+    summarise(
+      distal_connected = sum(signal),
+      .groups = "drop"
+    )
+  
+  return(result)
+}
+
+
+# 5.final merge
+safe_full_join <- function(list_of_tables) {
+  Reduce(function(x, y) {
+    dplyr::full_join(x, y, by="gene")
+  }, list_of_tables)
+}
+
+
+## Sample definitions
 samples <- list(
   tissue37 = list(
     peaks = c(
-      "tissue37_H3K27ac" = here::here("input", "tissue37_H3K27ac.bed.gz"),
-      "tissue37_H3K4me3" = here::here("input", "tissue37_H3K4me3.bed.gz"),
-      "tissue37_CTCF"    = here::here("input", "tissue37_CTCF.bed.gz")
+      "tissue37_H3K27ac" = here::here("tissue37_H3K27ac.bed.gz"),
+      "tissue37_H3K4me3" = here::here("tissue37_H3K4me3.bed.gz"),
+      "tissue37_CTCF"    = here::here("tissue37_CTCF.bed.gz")
     ),
-    expr = here::here("input", "tissue37_RNAseq.tsv")
+    hic = here::here("tissue54_HiC.bedpe.gz"),
+    expr = here::here("tissue37_RNAseq.tsv")
   ),
   tissue54 = list(
     peaks = c(
-      "tissue54_H3K27ac" = here::here("input", "tissue54_H3K27ac.bed.gz"),
-      "tissue54_H3K4me3" = here::here("input", "tissue54_H3K4me3.bed.gz"),
-      "tissue54_CTCF"    = here::here("input", "tissue54_CTCF.bed.gz"),
-      "tissue54_ATAC"    = here::here("input", "tissue54_ATAC.bed.gz")
+      "tissue54_H3K27ac" = here::here("tissue54_H3K27ac.bed.gz"),
+      "tissue54_H3K4me3" = here::here("tissue54_H3K4me3.bed.gz"),
+      "tissue54_CTCF"    = here::here("tissue54_CTCF.bed.gz"),
+      "tissue54_ATAC"    = here::here("tissue54_ATAC.bed.gz")
     ),
-    expr = here::here("input", "tissue54_RNAseq.tsv")
+    hic = here::here("tissue54_HiC.bedpe.gz"),
+    expr = here::here("tissue54_RNAseq.tsv")
   ),
   PC3_1 = list(
     peaks = c(
-      "PC3_H3K27ac" = here::here("input", "PC3_H3K27ac.bed.gz"),
-      "PC3_H3K4me3" = here::here("input", "PC3_H3K4me3.bed.gz"),
-      "PC3_CTCF"    = here::here("input", "PC3_CTCF.bed.gz"),
-      "PC3_ATAC"    = here::here("input", "PC3_ATAC.bed.gz")
+      "PC3_H3K27ac" = here::here("PC3_H3K27ac.bed.gz"),
+      "PC3_H3K4me3" = here::here("PC3_H3K4me3.bed.gz"),
+      "PC3_CTCF"    = here::here("PC3_CTCF.bed.gz"),
+      "PC3_ATAC"    = here::here("PC3_ATAC.bed.gz")
     ),
-    expr = here::here("input", "PC3_RNAseq1.tsv")
+    hic = here::here("PC3_HiC.bedpe.gz"),
+    expr = here::here("PC3_RNAseq1.tsv")
   ),
   PC3_2 = list(
     peaks = c(
-      "PC3_H3K27ac" = here::here("input", "PC3_H3K27ac.bed.gz"),
-      "PC3_H3K4me3" = here::here("input", "PC3_H3K4me3.bed.gz"),
-      "PC3_CTCF"    = here::here("input", "PC3_CTCF.bed.gz"),
-      "PC3_ATAC"    = here::here("input", "PC3_ATAC.bed.gz")
+      "PC3_H3K27ac" = here::here("PC3_H3K27ac.bed.gz"),
+      "PC3_H3K4me3" = here::here("PC3_H3K4me3.bed.gz"),
+      "PC3_CTCF"    = here::here("PC3_CTCF.bed.gz"),
+      "PC3_ATAC"    = here::here("PC3_ATAC.bed.gz")
     ),
-    expr = here::here("input", "PC3_RNAseq2.tsv")
+    hic = here::here("PC3_HiC.bedpe.gz"),
+    expr = here::here("PC3_RNAseq2.tsv")
   )
 )
 
+## Processing functions  
 # Chromatin marks per sample
-process_sample_chromatin <- function(peak_files, txdb, tx2gene_clean) {
-
-  feature_list <- lapply(names(peak_files), function(mark) {
-    annotate_and_summarize(peak_files[[mark]], mark, txdb, tx2gene_clean)
-  })
-
-  chromatin <- purrr::reduce(feature_list, dplyr::full_join, by = "gene")
+process_sample_chromatin <- function(peak_files, hic_file, txdb, tx2gene_clean) {
+  
+  hic_obj <- process_hic_sample(hic_file, txdb, tx2gene_clean)
+  
+  feature_list <- list()
+  
+  for (mark in names(peak_files)) {
+    
+    file <- peak_files[[mark]]
+    
+    base <- annotate_and_summarize(file, mark, txdb, tx2gene_clean)
+    
+    connected <- data.frame(
+      gene = character(),
+      distal_connected = numeric()
+    )
+    
+    if (grepl("H3K27ac|ATAC", mark)) {
+      
+      distal_peaks <- readPeakFile(file)
+      distal_peaks$signalValue <- as.numeric(distal_peaks$V7)
+      
+      connected <- compute_hic_connected_distal(distal_peaks, hic_obj)
+      
+      base <- dplyr::left_join(base, connected, by="gene")
+    }
+    
+    feature_list[[mark]] <- base
+  }
+  
+  chromatin <- safe_full_join(feature_list)
   chromatin[is.na(chromatin)] <- 0
-
-  return(chromatin)
+  
+  chromatin
 }
 
+# HiC marks
+process_hic_sample <- function(hic_file, txdb, tx2gene_clean) {
+  
+  message("Processing Hi-C: ", hic_file)
+  
+  hic <- read.table(hic_file, header = FALSE)
+  
+  colnames(hic)[1:6] <- c("chr1","start1","end1","chr2","start2","end2")
+  
+  gr1 <- GRanges(hic$chr1, IRanges(hic$start1, hic$end1))
+  gr2 <- GRanges(hic$chr2, IRanges(hic$start2, hic$end2))
+  
+  genome(gr1) <- "hg38"
+  genome(gr2) <- "hg38"
+  
+  seqlevelsStyle(gr1) <- "UCSC"
+  seqlevelsStyle(gr2) <- "UCSC"
+  
+  # promoters
+  prom <- promoters(txdb, upstream = 1000, downstream = 100)
+  
+  prom_df <- as.data.frame(prom)
+  prom_df$tx_id <- sub("\\..*", "", prom_df$tx_name)
+  prom_df$gene <- tx2gene_clean[prom_df$tx_id]
+  
+  keep <- !is.na(prom_df$gene)
+  prom <- prom[keep]
+  prom$gene <- prom_df$gene[keep]
+  
+  hits1 <- findOverlaps(prom, gr1)
+  hits2 <- findOverlaps(prom, gr2)
+  
+  # SAFE early exit
+  if (length(hits1) == 0 && length(hits2) == 0) {
+    return(list(
+      links = data.frame(gene=character(), region=integer(), side=character()),
+      gr1 = gr1,
+      gr2 = gr2
+    ))
+  }
+  
+  prom_links <- rbind(
+    data.frame(
+      gene = prom$gene[queryHits(hits1)],
+      region = subjectHits(hits1),
+      side = "gr1"
+    ),
+    data.frame(
+      gene = prom$gene[queryHits(hits2)],
+      region = subjectHits(hits2),
+      side = "gr2"
+    )
+  )
+  
+  prom_links <- prom_links[complete.cases(prom_links), ]
+  
+  list(
+    links = prom_links,
+    gr1 = gr1,
+    gr2 = gr2
+  )
+}
+
+
+## Execution
 # Read expression data
 read_expr <- function(f) {
   message("Reading: ", f)
@@ -149,12 +362,14 @@ read_expr <- function(f) {
   return(expr_df)
 }
 
+
 # Merge per sample: chromatin + expression
 process_sample <- function(sample_name, sample_info, txdb, tx2gene_clean) {
 
   message("Processing: ", sample_name)
 
-  chromatin <- process_sample_chromatin(sample_info$peaks, txdb, tx2gene_clean)
+  chromatin <- process_sample_chromatin(sample_info$peaks, sample_info$hic, txdb, tx2gene_clean)
+
   expr <- read_expr(sample_info$expr)
 
   merged <- dplyr::inner_join(chromatin, expr, by = "gene")
@@ -164,12 +379,14 @@ process_sample <- function(sample_name, sample_info, txdb, tx2gene_clean) {
   return(merged)
 }
 
+
 # Build full dataset
 ml_list <- lapply(names(samples), function(s) {
   process_sample(s, samples[[s]], txdb, tx2gene_clean)
 })
 
 ml_matrix <- dplyr::bind_rows(ml_list)
+
 
 # Add labels
 ml_matrix$label <- ifelse(
@@ -178,19 +395,105 @@ ml_matrix$label <- ifelse(
   "normal"
 )
 
+
 # Log-transform expression to stabilize variance
 ml_matrix$TPM <- log2(ml_matrix$TPM + 1)
 
+
 # Scale/center all numeric features
+scale_per_feature <- function(df) {
+  num_cols <- sapply(df, is.numeric)
+  df[, num_cols] <- lapply(df[, num_cols], function(x) {
+    if (all(is.na(x))) return(x)
+    scale(x)
+  })
+  return(df)
+}
+
 numeric_cols <- sapply(ml_matrix, is.numeric)
-ml_matrix[, numeric_cols] <- scale(ml_matrix[, numeric_cols])
+ml_matrix[, numeric_cols] <- scale_per_feature(ml_matrix[, numeric_cols])
 
-cat("Dimensions:", nrow(ml_matrix), "rows x", ncol(ml_matrix), "columns\n")
-cat("Samples:\n")
-print(table(ml_matrix$sample))
-cat("\nLabels:\n")
-print(table(ml_matrix$label))
-cat("\nFeature summary:\n")
-summary(ml_matrix)
 
-write.csv(ml_matrix, here::here("ml_matrix.csv"), row.names = FALSE)
+# download TCGA prostate RNA-seq
+query <- GDCquery(
+  project = "TCGA-PRAD",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+
+GDCdownload(query)
+tcga_data <- GDCprepare(query)
+
+# extract expression matrix
+tcga_expr <- assay(tcga_data)
+tcga_expr_norm <- apply(tcga_expr, 2, function(x) {
+  (x / sum(x)) * 1e6
+})
+
+
+# gene IDs cleanup
+genes <- rownames(tcga_expr_norm)
+genes <- sub("\\..*", "", genes)
+
+tcga_expr_norm <- as.data.frame(tcga_expr_norm)
+tcga_expr_norm$gene <- genes
+
+
+# extract sample metadata (cancer vs normal)
+meta <- colData(tcga_data)
+
+sample_types <- as.character(meta$shortLetterCode)
+# TP = tumor, NT = normal
+labels <- ifelse(sample_types == "TP", "cancer",
+                 ifelse(sample_types == "NT", "normal", NA))
+
+valid <- !is.na(labels)
+
+tcga_expr_norm <- tcga_expr_norm[, valid]
+labels <- labels[valid]
+
+
+# convert format
+tcga_long <- tcga_expr_norm %>%
+  tidyr::pivot_longer(
+    cols = -gene,
+    names_to = "sample",
+    values_to = "TPM"
+  )
+
+tcga_long$label <- labels[match(tcga_long$sample, colnames(tcga_expr_norm))]
+
+
+# align both datasets
+common_genes <- intersect(ml_matrix$gene, tcga_long$gene)
+
+ml_matrix <- ml_matrix[ml_matrix$gene %in% common_genes, ]
+tcga_long <- tcga_long[tcga_long$gene %in% common_genes, ]
+
+
+# log-transform and scale
+tcga_long$TPM <- log2(tcga_long$TPM + 1)
+tcga_long <- scale_per_feature(tcga_long)
+
+
+# add missing chromatin columns to TCGA
+chromatin_cols <- setdiff(colnames(ml_matrix), c("gene", "TPM", "sample", "label"))
+
+for (col in chromatin_cols) {
+  tcga_long[[col]] <- NA
+}
+
+tcga_long$has_chromatin <- 0
+ml_matrix$has_chromatin <- 1
+
+
+# merge datasets 
+tcga_long$sample <- paste0("TCGA_", tcga_long$sample)
+
+ml_full <- dplyr::bind_rows(ml_matrix, tcga_long)
+ml_full$source <- ifelse(grepl("TCGA", ml_full$sample), "TCGA", "local")
+
+summary(ml_full)
+
+write.csv(ml_full, here::here("ml_full.csv"), row.names = FALSE)
