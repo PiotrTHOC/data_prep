@@ -261,12 +261,15 @@ process_sample_chromatin <- function(peak_files, hic_file, txdb, tx2gene_clean) 
     )
     
     if (grepl("H3K27ac|ATAC", mark)) {
-      
+
       distal_peaks <- readPeakFile(file)
       distal_peaks$signalValue <- as.numeric(distal_peaks$V7)
-      
+
       connected <- compute_hic_connected_distal(distal_peaks, hic_obj)
-      
+
+      colnames(connected)[colnames(connected) != "gene"] <-
+        paste0(mark, "_", colnames(connected)[colnames(connected) != "gene"])
+
       base <- dplyr::left_join(base, connected, by="gene")
     }
     
@@ -344,39 +347,16 @@ process_hic_sample <- function(hic_file, txdb, tx2gene_clean) {
 
 
 ## Execution
-# Read expression data
-read_expr <- function(f) {
-  message("Reading: ", f)
-
-  expr_df <- read.table(f, header = TRUE, sep = "\t")
-
-  # keep only ENSEMBL genes
-  expr_df <- expr_df[grepl("^ENSG", expr_df$gene_id), ]
-
-  # remove version numbers
-  expr_df$gene <- sub("\\..*", "", expr_df$gene_id)
-
-  # keep relevant columns
-  expr_df <- expr_df[, c("gene", "TPM")]
-
-  return(expr_df)
-}
-
-
-# Merge per sample: chromatin + expression
+# Build per-sample chromatin features (no local RNA-seq)
 process_sample <- function(sample_name, sample_info, txdb, tx2gene_clean) {
 
   message("Processing: ", sample_name)
 
   chromatin <- process_sample_chromatin(sample_info$peaks, sample_info$hic, txdb, tx2gene_clean)
 
-  expr <- read_expr(sample_info$expr)
+  chromatin$sample <- sample_name
 
-  merged <- dplyr::inner_join(chromatin, expr, by = "gene")
-
-  merged$sample <- sample_name
-
-  return(merged)
+  return(chromatin)
 }
 
 
@@ -396,11 +376,7 @@ ml_matrix$label <- ifelse(
 )
 
 
-# Log-transform expression to stabilize variance
-ml_matrix$TPM <- log2(ml_matrix$TPM + 1)
-
-
-# Scale/center all numeric features
+# Scale/center all numeric features (applied after TCGA join below)
 scale_per_feature <- function(df) {
   num_cols <- sapply(df, is.numeric)
   df[, num_cols] <- lapply(df[, num_cols], function(x) {
@@ -409,9 +385,6 @@ scale_per_feature <- function(df) {
   })
   return(df)
 }
-
-numeric_cols <- sapply(ml_matrix, is.numeric)
-ml_matrix[, numeric_cols] <- scale_per_feature(ml_matrix[, numeric_cols])
 
 
 # download TCGA prostate RNA-seq
@@ -425,75 +398,59 @@ query <- GDCquery(
 GDCdownload(query)
 tcga_data <- GDCprepare(query)
 
-# extract expression matrix
+# expression matrix (rows = genes, cols = samples), CPM-normalized
 tcga_expr <- assay(tcga_data)
-tcga_expr_norm <- apply(tcga_expr, 2, function(x) {
-  (x / sum(x)) * 1e6
-})
+tcga_cpm <- apply(tcga_expr, 2, function(x) (x / sum(x)) * 1e6)
+
+# strip ENSG version suffixes so gene keys match the chromatin matrix
+rownames(tcga_cpm) <- sub("\\..*", "", rownames(tcga_cpm))
 
 
-# gene IDs cleanup
-genes <- rownames(tcga_expr_norm)
-genes <- sub("\\..*", "", genes)
+# label samples: TP = tumor (cancer), NT = solid tissue normal (adjacent tissue)
+sample_types <- as.character(colData(tcga_data)$shortLetterCode)
+tcga_labels <- ifelse(sample_types == "TP", "cancer",
+                      ifelse(sample_types == "NT", "normal", NA))
 
-tcga_expr_norm <- as.data.frame(tcga_expr_norm)
-tcga_expr_norm$gene <- genes
+valid <- !is.na(tcga_labels)
+tcga_cpm    <- tcga_cpm[, valid]
+tcga_labels <- tcga_labels[valid]
 
-
-# extract sample metadata (cancer vs normal)
-meta <- colData(tcga_data)
-
-sample_types <- as.character(meta$shortLetterCode)
-# TP = tumor, NT = normal
-labels <- ifelse(sample_types == "TP", "cancer",
-                 ifelse(sample_types == "NT", "normal", NA))
-
-valid <- !is.na(labels)
-
-tcga_expr_norm <- tcga_expr_norm[, valid]
-labels <- labels[valid]
+message("TCGA samples per label: ",
+        paste(names(table(tcga_labels)), table(tcga_labels),
+              sep = "=", collapse = ", "))
 
 
-# convert format
-tcga_long <- tcga_expr_norm %>%
-  tidyr::pivot_longer(
-    cols = -gene,
-    names_to = "sample",
-    values_to = "TPM"
-  )
+# log2(TPM+1) so variance reflects fold-change-scale dispersion
+tcga_log <- log2(tcga_cpm + 1)
 
-tcga_long$label <- labels[match(tcga_long$sample, colnames(tcga_expr_norm))]
+cancer_cols <- which(tcga_labels == "cancer")
+normal_cols <- which(tcga_labels == "normal")
 
-
-# align both datasets
-common_genes <- intersect(ml_matrix$gene, tcga_long$gene)
-
-ml_matrix <- ml_matrix[ml_matrix$gene %in% common_genes, ]
-tcga_long <- tcga_long[tcga_long$gene %in% common_genes, ]
-
-
-# log-transform and scale
-tcga_long$TPM <- log2(tcga_long$TPM + 1)
-tcga_long <- scale_per_feature(tcga_long)
-
-
-# add missing chromatin columns to TCGA
-chromatin_cols <- setdiff(colnames(ml_matrix), c("gene", "TPM", "sample", "label"))
-
-for (col in chromatin_cols) {
-  tcga_long[[col]] <- NA
+row_var <- function(mat, cols) {
+  apply(mat[, cols, drop = FALSE], 1, stats::var, na.rm = TRUE)
 }
 
-tcga_long$has_chromatin <- 0
-ml_matrix$has_chromatin <- 1
+tcga_agg <- data.frame(
+  gene             = rownames(tcga_log),
+  tcga_mean_cancer = rowMeans(tcga_log[, cancer_cols, drop = FALSE], na.rm = TRUE),
+  tcga_var_cancer  = row_var (tcga_log, cancer_cols),
+  tcga_mean_normal = rowMeans(tcga_log[, normal_cols, drop = FALSE], na.rm = TRUE),
+  tcga_var_normal  = row_var (tcga_log, normal_cols),
+  row.names = NULL,
+  stringsAsFactors = FALSE
+)
+
+# stripping ENSG version suffixes can produce duplicate gene keys; collapse them
+tcga_agg <- tcga_agg %>%
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(dplyr::across(dplyr::everything(), mean), .groups = "drop")
 
 
-# merge datasets 
-tcga_long$sample <- paste0("TCGA_", tcga_long$sample)
+# join TCGA aggregates onto chromatin matrix, then scale all numeric features
+ml_matrix <- dplyr::inner_join(ml_matrix, tcga_agg, by = "gene")
 
-ml_full <- dplyr::bind_rows(ml_matrix, tcga_long)
-ml_full$source <- ifelse(grepl("TCGA", ml_full$sample), "TCGA", "local")
+ml_matrix <- scale_per_feature(ml_matrix)
 
-summary(ml_full)
+summary(ml_matrix)
 
-write.csv(ml_full, here::here("ml_full.csv"), row.names = FALSE)
+write.csv(ml_matrix, here::here("ml_matrix_tcga.csv"), row.names = FALSE)
